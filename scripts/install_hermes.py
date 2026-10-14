@@ -516,13 +516,13 @@ def _fail(msg: str) -> int:
 
 # ------------------------------------------------------------- live catalog
 
-def _live_model_ids() -> list[str] | None:
-    """Ask the provider server (127.0.0.1:8787) for the live catalog, enabled only.
-    Returns None when the server is down or the answer is unusable — caller
-    falls back to the starter snapshot."""
-    api = DEFAULT_API.rsplit("/", 1)[0]  # http://127.0.0.1:8787
+def _live_model_ids(api: str) -> list[str] | None:
+    """Ask the provider server at the entry's own api base for the live catalog,
+    enabled only. `api` is the full endpoint URL (…/v1). Returns None when the
+    server is down or the answer is unusable — caller decides the fallback."""
+    base = api.rstrip("/").rsplit("/", 1)[0] if api.rstrip("/").endswith("/v1") else api.rstrip("/")
     try:
-        with urllib.request.urlopen(f"{api}/v1/models", timeout=5) as resp:
+        with urllib.request.urlopen(f"{base}/v1/models", timeout=5) as resp:
             data = json.loads(resp.read().decode("utf-8"))
     except Exception:
         return None
@@ -530,15 +530,23 @@ def _live_model_ids() -> list[str] | None:
     return sorted(ids) if ids else None
 
 
-def _resolve_models(live: bool, offline: bool) -> tuple[list[str], str]:
-    """(model ids to write, source note). --live forces the server; default tries
-    it opportunistically; --offline (or a down server) keeps the snapshot."""
-    if not offline:
-        ids = _live_model_ids()
-        if ids is not None:
-            if live or True:  # opportunistic: a reachable server always wins
-                return ids, f"live catalog ({len(ids)} models)"
-    return list(MODEL_IDS), f"starter snapshot ({len(MODEL_IDS)} models)"
+def _resolve_models(live: bool, offline: bool, api: str) -> tuple[list[str], str]:
+    """(model ids to write, source note). Default: try the server at `api`
+    opportunistically, fall back to the starter snapshot when it is down.
+    --live: the server is REQUIRED — a down server is an error, not a fallback.
+    --offline: never touch the network, snapshot only."""
+    if offline:
+        return list(MODEL_IDS), f"starter snapshot ({len(MODEL_IDS)} models)"
+    ids = _live_model_ids(api)
+    if ids is not None:
+        return ids, f"live catalog ({len(ids)} models)"
+    if live:
+        raise SystemExit(
+            f"install_hermes: --live: no catalog from provider at {api} — "
+            "server down or unhealthy. Start it (devin-provider serve or the "
+            "launchd agent) or drop --live / use --offline."
+        )
+    return list(MODEL_IDS), f"starter snapshot ({len(MODEL_IDS)} models; provider at {api} unreachable)"
 
 # ---------------------------------------------------------------------- main
 
@@ -580,7 +588,7 @@ def main(argv: list[str] | None = None) -> int:
 
     models_note = ""
     if not args.remove:
-        effective, models_note = _resolve_models(args.live, args.offline)
+        effective, models_note = _resolve_models(args.live, args.offline, args.api)
         MODEL_IDS[:] = effective
         MODEL_SET.clear()
         MODEL_SET.update(effective)

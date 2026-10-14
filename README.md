@@ -93,7 +93,7 @@ providers:
     models:
       - glm-5-2
       - glm-5-3-max
-      # ... 57 starter selectors in total
+      # ... full live catalog (262 models) by default — see below
 ```
 
 3. Prints next steps and a `devin-acp` note. `--cutover` also runs the old-patch removal (see Cutover). The `--cutover` path was not run through install.sh.
@@ -104,6 +104,11 @@ How the merge behaves (`scripts/install_hermes.py`):
 - It backs up the config to `config.yaml.bak-devin-provider-<timestamp>` before writing.
 - It is idempotent. A re-run changes only what differs.
 - It is additive. A re-run adds back any starter missing from the entry, keeps models you added by hand, and removes nothing. A starter you deleted by hand comes back on the next run.
+- The `models:` list is a **snapshot written at install time**, not a live view. Hermes never live-probes the devin entry
+  (an explicit `models:` list with no `api_key` is skipped by the picker's probe policy by design — offline endpoints
+  must not block the picker). New Devin models appear after re-running `scripts/install_hermes.py`: default pulls the
+  live catalog from the provider server, `--live` requires it (exits non-zero if the server is down), `--offline` pins
+  the 57-model starter snapshot.
 - An inline `models:` value (for example `models: {}`) is replaced with the list form.
 - If the config file is missing, it stops with an error.
 - Flags: `--dry-run` prints the proposed edit and writes nothing. `--remove` deletes the `devin` entry. `--config`, `--api`, and `--transport` override the defaults (`http://127.0.0.1:8787/v1` and `chat_completions`).
@@ -116,8 +121,7 @@ python3 scripts/install_hermes.py --dry-run
 
 ## Models
 
-The shipped entry has 57 starter selectors from an earlier catalog snapshot. In this sandbox they have not been re-checked against a live catalog, because the sandbox tests had no valid token. Use a selector exactly as `devin-provider models` lists it. Models you add under `models:` by hand survive re-runs. Removing a starter by hand does not stick: the next run re-adds it.
-
+The shipped entry carries the full live catalog (262 models, verified 2026-10-14) when the provider server is up at install time; the 57-entry starter snapshot is the offline fallback.
 ## Configuration
 
 | Variable | Default | Purpose |
@@ -229,7 +233,7 @@ legacy/                         created by cutover; gitignored
 - Whether Hermes accepts `transport: chat_completions` for a custom provider, and reads the `models:` list, is not verified in this sandbox.
 - Transport value conflict: this README, the installer, and the shipped entry use `chat_completions`, but DESIGN.md (line 27) says `openai_chat`. Unresolved; the Hermes enum is not verified.
 - Binding to a non-loopback address is untested.
-- In this sandbox, the starter model list has not been checked against a live catalog.
+- Entitlement is enforced at chat time, not in the catalog: a listed model can still be rejected per-account tier at request time (e.g. `upgrade to access this model`). The catalog lists everything the backend serves.
 
 ## Status
 
