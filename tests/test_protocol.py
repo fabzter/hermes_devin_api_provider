@@ -767,6 +767,83 @@ def _run_all() -> int:
     return 1 if failed else 0
 
 
+# ---- tool-call name (#2) + result coalescing (live-verified 2026-10-14) ------
+
+def test_accumulate_call_captures_wire_name():
+    import uuid as _uuid
+    calls, by_id = [], {}
+    cid = "call_x#1"
+    p._accumulate_call(_encode_toolcall_frame(cid, "read_file", ""), calls, by_id)
+    p._accumulate_call(_encode_toolcall_frame("", "", "{\"path\":}"), calls, by_id)
+    assert calls[0]["name"] == "read_file"
+    assert calls[0]["args"] == "{\"path\":}"
+
+def _encode_toolcall_frame(cid, name, args):
+    parts = []
+    if cid: parts.append(p.wstr(1, cid))
+    if name: parts.append(p.wstr(2, name))
+    if args: parts.append(p.wstr(3, args))
+    return b"".join(parts)
+
+
+def _msg_fields(buf: bytes) -> dict:
+    fields = p.parse_fields(buf)
+    out = {}
+    for num, wire, value in fields:
+        if num == 2 and wire == 0:
+            out["source"] = value
+        elif num == 7 and wire == 2:
+            out["tool_call_id"] = value.decode()
+        elif num == 3 and wire == 2:
+            out["text"] = out.get("text", "") + value.decode(errors="replace")
+    return out
+
+def test_parallel_results_coalesce_into_one_item():
+    msgs = [
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "terminal", "arguments": "{}"}},
+            {"id": "c2", "type": "function", "function": {"name": "web_search", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "r1"},
+        {"role": "tool", "tool_call_id": "c2", "content": "r2"},
+    ]
+    _, raw_items = p._encode_messages(msgs)
+    items = [_msg_fields(b) for b in raw_items]
+    tool_items = [i for i in items if i.get("source") == 4]
+    assert len(tool_items) == 1, [i.get("source") for i in items]
+    assert "r1" in tool_items[0]["text"] and "r2" in tool_items[0]["text"]
+    assert tool_items[0]["tool_call_id"] == "c1"
+
+def test_sequential_results_stay_separate():
+    msgs = [
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "terminal", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "r1"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "c2", "type": "function", "function": {"name": "web_search", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "c2", "content": "r2"},
+    ]
+    _, raw_items = p._encode_messages(msgs)
+    items = [_msg_fields(b) for b in raw_items]
+    tool_items = [i for i in items if i.get("source") == 4]
+    assert len(tool_items) == 2
+
+def test_tool_result_then_user_then_result_not_merged():
+    msgs = [
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "terminal", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "r1"},
+        {"role": "user", "content": "next"},
+        {"role": "tool", "tool_call_id": "c2", "content": "r2"},
+    ]
+    _, raw_items = p._encode_messages(msgs)
+    items = [_msg_fields(b) for b in raw_items]
+    # c2 result is folded to user text (not in call_ids) — unchanged semantics
+    assert [i.get("source") for i in items] == [1, 2, 4, 1]
+
+
 if __name__ == "__main__":
     sys.exit(_run_all())
 
@@ -853,3 +930,4 @@ def test_expired_no_longer_auth_marker():
 def test_unavailable_code_maps_503():
     e = _cls("unavailable", "server is busy")
     assert e.code == "unavailable" and e.status == 503
+

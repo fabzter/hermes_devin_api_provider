@@ -903,7 +903,18 @@ def _encode_messages(messages: Any) -> tuple[str, list[bytes]]:
             body = _content_text(content)
             label = f"[tool result for {tool_id}]: {body}" if tool_id else f"[tool result]: {body}"
             if tool_id and tool_id in call_ids:  # native round-trip
-                items.append(_item(4, label, tool_call_id=tool_id))
+                prev = items[-1] if items else None
+                # Live-verified 2026-10-14: an assistant turn with 2+ tool_calls
+                # followed by 2+ consecutive tool_result messages is rejected
+                # upstream (HTTP 400 "issue with this request"). A single result
+                # message (results merged) is accepted; so are results split by
+                # user turns. Coalesce consecutive native tool results into ONE
+                # ChatMessage to stay inside the accepted shape.
+                if (prev is not None and prev["source"] == 4 and prev["tool_call_id"]
+                        and prev["tool_call_id"] != tool_id):
+                    prev["text"] = f"{prev['text']}\n{label}"
+                else:
+                    items.append(_item(4, label, tool_call_id=tool_id))
             else:  # folds into user text when not a native round-trip
                 items.append(_item(1, label))
         else:
@@ -945,15 +956,18 @@ def _build_chat_request(token: str, *, messages: Any, model: str, max_tokens: An
 # ---- chat response (DESIGN § GetChatMessage response) -----------------------
 
 def _accumulate_call(value: bytes, calls: list[dict], by_id: dict[str, dict]) -> None:
-    """ChatToolCall (#6). No name on the wire; id-less fragments extend the most recent call."""
+    """ChatToolCall (#6). The response DOES carry the tool name at #2 (live-verified
+    2026-10-14: every first fragment of a call carries 1=id, 2=name, then 3=arg
+    fragments). #2 accumulates like the other fragments in case it streams."""
     fields = _sub(value)
     call_id = _first_str(fields, 1) or ""
     call = by_id.get(call_id) if call_id else (calls[-1] if calls else None)
     if call is None:
         call_id = call_id or f"call_{uuid.uuid4().hex[:24]}"
-        call = {"id": call_id, "args": "", "invalid": ""}
+        call = {"id": call_id, "name": "", "args": "", "invalid": ""}
         calls.append(call)
         by_id[call_id] = call
+    call["name"] += _first_str(fields, 2) or ""
     call["args"] += _first_str(fields, 3) or ""
     call["invalid"] += _first_str(fields, 4) or ""
 
@@ -1055,8 +1069,11 @@ def _chat_events(pieces: Iterable[bytes], *, token: str, model: str,
         raise DevinError(reader.partial_error() or "upstream stream ended before completion",
                          "upstream_error", 502)
     for index, call in enumerate(calls):
+        name = call.get("name") or ""
+        if not name:  # frame omitted #2 — fall back to schema reverse-lookup
+            name = _resolve_tool_name(call["args"], tool_specs)
         yield {"type": "tool_call", "index": index, "id": call["id"],
-               "name": _resolve_tool_name(call["args"], tool_specs),
+               "name": name,
                "arguments": _final_arguments(call)}
     # DESIGN § GetChatMessage response: 2 -> stop, 3 -> length
     yield {"type": "finish", "reason": "length" if finish == 3 else "stop"}
