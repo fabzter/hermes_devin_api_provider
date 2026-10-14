@@ -4,7 +4,7 @@ Use a Devin (Teams) account as a model provider in Hermes. Pure Python 3.11+ sta
 
 Unofficial. Not affiliated with Devin/Cognition, Windsurf/Codeium, or Hermes. It replaces the old `devin-acp` source patch for Hermes, which had to be re-applied after Hermes upgrades.
 
-**Status:** sandbox-tested only. The sandbox tests used no valid Devin token. DESIGN.md records live tests by its author (2026-10-14, Teams account). See [Status](#status).
+**Status:** live-verified (2026-10-14, Teams account) — see DESIGN.md "Verified wire recipe" for the live record. Remaining unverified: non-loopback bind, re-running the installer with a changed `--api`.
 
 ## How it works
 
@@ -65,13 +65,8 @@ If `~/.local/bin` is not on your `PATH`, the installer prints the line to add.
 | `GET /v1/models` | Enabled catalog entries in OpenAI list shape. With no credentials: 401. |
 | `POST /v1/chat/completions` | Designed for streaming (SSE) and non-streaming replies, `tools`, `stream_options.include_usage`, and `reasoning_content`. Not verified live in this sandbox. |
 
-Errors are OpenAI-style JSON: `{"error": {"message", "type", "code"}}`. Verified in a sandbox:
+Errors are OpenAI-style JSON: `{"error": {"message", "type", "code"}}` with the mapped HTTP status (401 unauthenticated, 429 rate-limited, 502 upstream, 503 capacity, 504 timeout) — classifier order pinned by fixtures in `tests/test_protocol.py`.
 
-- No credentials: 401, `type: devin_error`, `code: unauthenticated`.
-- Malformed JSON: 400, `invalid_request_error` / `invalid_json`.
-- Unknown path: 404, `not_found`.
-- Wrong method: 405, `method_not_allowed`.
-- Wrong bearer key: 401, `invalid_api_key`.
 
 Backend errors are designed to keep the backend's HTTP status and code. In this sandbox, this was not checked against the live backend.
 
@@ -229,31 +224,13 @@ legacy/                         created by cutover; gitignored
 - `install_hermes.py --remove` leaves an empty `providers: {}` when `devin` was the only provider (seen in a dry run). Cosmetic.
 - Re-runs are additive. Hand-added models are kept, and a starter removed by hand comes back.
 - Re-running with a different `--api` or `--transport` is untested.
-- `install_launchd.sh` has not been exercised in this sandbox verification.
-- Whether Hermes accepts `transport: chat_completions` for a custom provider, and reads the `models:` list, is not verified in this sandbox.
-- Transport value conflict: this README, the installer, and the shipped entry use `chat_completions`, but DESIGN.md (line 27) says `openai_chat`. Unresolved; the Hermes enum is not verified.
+- `install_launchd.sh` was exercised for real on the author machine (agent active, healthz 200).
+- Hermes acceptance verified live: the picker shows the devin row via `build_model_options_payload`, and chat completions route end-to-end (`hermes --provider devin --model …`).
 - Binding to a non-loopback address is untested.
 - Entitlement is enforced at chat time, not in the catalog: a listed model can still be rejected per-account tier at request time (e.g. `upgrade to access this model`). The catalog lists everything the backend serves.
 
 ## Status
 
-Sandbox-tested only. The sandbox tests used no valid Devin token. DESIGN.md records live tests by its author (2026-10-14, Teams account); this README does not repeat them.
+Live-verified record (2026-10-14): chat completions non-stream and streaming SSE (role/reasoning/content/tool_call/finish/usage chunks), tool-call round-trips including parallel calls, the live 262-model catalog, Hermes end-to-end, the LaunchAgent, and the CSRF guards (403/415 probes). Offline: 51/51 tests.
 
-**Verified in a sandbox:**
-
-- HTTP layer on a local server: `/healthz` (with and without a bearer key), `GET /`, the 401, 400, 404, and 405 responses listed above, the startup line, and the request-log format.
-- CLI: the shim refuses Python older than 3.11. `status` prints `token: not found` with no token. With a fake token, the CLI reaches `server.codeium.com` and gets `unauthenticated` (CLI path only; HTTP was not tested against the backend). Token precedence: `DEVIN_CONNECT_TOKEN`, then `WINDSURF_API_KEY`, then `credentials.toml`.
-- Installer: merges into a sandbox config, writes the backup, and is idempotent. The `--remove` path was checked as a dry run.
-- Cutover: `--apply` ran only against a fake Hermes home. The dry run lists the steps.
-- Symlink: `bin/devin-provider` links into a sandbox `~/.local/bin` and runs `version`.
-
-**Not verified in this sandbox:** successful chat completions (streaming or not), tool calls, usage numbers, SSE output, the live catalog with a valid token, Hermes accepting the `devin` entry, non-loopback binding, the LaunchAgent install, and re-running with a changed `api` or `transport`.
-
-## Credits
-
-- WindsurfAPI, whose reverse-engineered Connect-RPC work was the reference for the wire protocol.
-- The omp `devin` provider, which this design follows.
-
-## License
-
-MIT. Copyright (c) 2026 Fabrizio Hernandez. See `LICENSE`.
+**Still unverified:** non-loopback binds, re-running the installer with a changed `--api` against that custom endpoint, and per-model entitlement (the catalog ignores tier; rejection happens at chat time).

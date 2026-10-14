@@ -234,8 +234,15 @@ def _stream_error(body: bytes) -> DevinError:
 
 
 def _list_models_with(body: bytes) -> list[dict]:
-    with _patched_post(FakePost(body)):
-        return p.list_models(TOKEN, refresh=True)
+    saved = {k: getattr(p, k) for k in ("_MODELS_CACHE", "_MODELS_CACHED_AT")}
+    try:
+        p._MODELS_CACHE = None
+        p._MODELS_CACHED_AT = 0.0
+        with _patched_post(FakePost(body)):
+            return p.list_models(TOKEN, refresh=True)
+    finally:
+        for k, v in saved.items():
+            setattr(p, k, v)
 
 
 # ---------------------------------------------------------------- wire codec
@@ -842,6 +849,68 @@ def test_tool_result_then_user_then_result_not_merged():
     items = [_msg_fields(b) for b in raw_items]
     # c2 result is folded to user text (not in call_ids) — unchanged semantics
     assert [i.get("source") for i in items] == [1, 2, 4, 1]
+
+
+# ---- catalog TTL + fallback (live-verified semantics) ------------------------
+
+def test_catalog_ttl_expiry_refetches():
+    fetched = {"n": 0}
+    class FakeCatalog:
+        def __call__(self, path, tok, proto, *, timeout, content_type, connect_rpc):
+            fetched["n"] += 1
+            # two models on first fetch, three after expiry
+            n = fetched["n"]
+            entries = b""
+            for i in range(2 if n == 1 else 3):
+                cfg = p.wstr(1, f"Model {i}") + p.wstr(22, f"model-{i}")
+                entries += p.wmsg(1, cfg)
+            return entries
+    fake = FakeCatalog()
+    saved = {k: getattr(p, k) for k in ("_MODELS_CACHE", "_MODELS_CACHED_AT")}
+    saved_post = p._post_connect
+    try:
+        p._MODELS_CACHE = None
+        p._MODELS_CACHED_AT = 0.0
+        p._post_connect = fake
+        m1 = p.list_models(token="tok")
+        assert [x["id"] for x in m1] == ["model-0", "model-1"]
+        # within TTL: no re-fetch
+        m2 = p.list_models(token="tok")
+        assert fetched["n"] == 1
+        # expire: re-fetch, second catalog wins
+        p._MODELS_CACHED_AT = p.time.monotonic() - (p._MODELS_TTL_SECONDS + 1)
+        m3 = p.list_models(token="tok")
+        assert fetched["n"] == 2
+        assert [x["id"] for x in m3] == ["model-0", "model-1", "model-2"]
+    finally:
+        p._post_connect = saved_post
+        for k, v in saved.items():
+            setattr(p, k, v)
+
+
+def test_catalog_fallback_serves_last_good_on_upstream_error():
+    calls = {"n": 0}
+    def flaky(path, tok, proto, *, timeout, content_type, connect_rpc):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            cfg = p.wstr(1, "Only Model") + p.wstr(22, "only-model")
+            return p.wmsg(1, cfg)
+        raise p.DevinError("upstream down", "upstream_error", 502)
+    saved = {k: getattr(p, k) for k in ("_MODELS_CACHE", "_MODELS_CACHED_AT")}
+    saved_post = p._post_connect
+    try:
+        p._MODELS_CACHE = None
+        p._MODELS_CACHED_AT = 0.0
+        p._post_connect = flaky
+        m1 = p.list_models(token="tok")
+        assert [x["id"] for x in m1] == ["only-model"]
+        p._MODELS_CACHED_AT = p.time.monotonic() - (p._MODELS_TTL_SECONDS + 1)
+        m2 = p.list_models(token="tok")  # expired + error -> last good
+        assert [x["id"] for x in m2] == ["only-model"]
+    finally:
+        p._post_connect = saved_post
+        for k, v in saved.items():
+            setattr(p, k, v)
 
 
 if __name__ == "__main__":

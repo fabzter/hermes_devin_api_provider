@@ -6,6 +6,7 @@ or logs. Every error text passes through _redact(), so the session token never l
 """
 
 import json
+import time
 import os
 import re
 import socket
@@ -620,6 +621,8 @@ def _control_frame(flag: int, payload: bytes, token: str) -> bool:
 # ---- catalog (DESIGN § GetCliModelConfigs) ----------------------------------
 
 _MODELS_CACHE: list[dict] | None = None
+_MODELS_CACHED_AT: float = 0.0  # monotonic time of the last successful fetch
+_MODELS_TTL_SECONDS = 600.0  # advisory: server-side catalog changes need a re-fetch window
 _MODELS_LOCK = threading.Lock()
 
 
@@ -705,17 +708,34 @@ def _parse_catalog(body: bytes, token: str) -> list[dict]:
 
 
 def list_models(token: str | None = None, timeout: float = 30.0, refresh: bool = False) -> list[dict]:
-    """Live catalog as [{id, label, provider, enabled}]. Memoized in-process unless refresh=True."""
-    global _MODELS_CACHE
+    """Live catalog as [{id, label, provider, enabled}].
+
+    Memoized for _MODELS_TTL_SECONDS (so a long-lived server picks up upstream
+    catalog changes within ~10 min instead of pinning them for the process
+    lifetime). `refresh=True` forces a re-fetch. On upstream failure after the
+    cache expires, the last good catalog is served (staleness beats an empty
+    /v1/models for a loopback single-user endpoint)."""
+    global _MODELS_CACHE, _MODELS_CACHED_AT
     with _MODELS_LOCK:
-        if _MODELS_CACHE is not None and not refresh:
+        fresh = (_MODELS_CACHE is not None and not refresh
+                 and time.monotonic() - _MODELS_CACHED_AT < _MODELS_TTL_SECONDS)
+        if fresh:
             return [dict(item) for item in _MODELS_CACHE]
     tok = token or get_token()
-    raw = _post_connect(CATALOG_PATH, tok, wmsg(1, _client_metadata(tok)), timeout=timeout,
-                        content_type="application/proto", connect_rpc=False)
-    models = _parse_catalog(raw, tok)
+    try:
+        raw = _post_connect(CATALOG_PATH, tok, wmsg(1, _client_metadata(tok)), timeout=timeout,
+                            content_type="application/proto", connect_rpc=False)
+        models = _parse_catalog(raw, tok)
+    except DevinError:
+        # Expired cache + upstream error: serve the last good catalog rather
+        # than an empty /v1/models. A null cache still raises (never invent data).
+        with _MODELS_LOCK:
+            if _MODELS_CACHE is not None:
+                return [dict(item) for item in _MODELS_CACHE]
+        raise
     with _MODELS_LOCK:
         _MODELS_CACHE = models
+        _MODELS_CACHED_AT = time.monotonic()
     return [dict(item) for item in models]
 
 
