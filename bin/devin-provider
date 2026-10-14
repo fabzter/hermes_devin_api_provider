@@ -1,0 +1,21 @@
+#!/bin/sh
+# devin-provider: CLI shim. Resolves symlinks so ~/.local/bin/devin-provider finds this repo.
+set -eu
+src=$0
+while [ -L "$src" ]; do
+  dir=$(cd "$(dirname "$src")" && pwd -P)
+  link=$(readlink "$src")
+  case $link in
+    /*) src=$link ;;
+    *) src=$dir/$link ;;
+  esac
+done
+root=$(cd "$(dirname "$src")/.." && pwd -P)
+PYTHONPATH=$root${PYTHONPATH:+:$PYTHONPATH}
+export PYTHONPATH
+if ! python3 -c 'import sys; sys.exit(sys.version_info < (3, 11))' 2>/dev/null; then
+  have=$(python3 -c 'import sys; print(sys.version.split()[0])' 2>/dev/null || echo none)
+  echo "devin-provider: needs Python 3.11+ as python3 on PATH (found: $have)" >&2
+  exit 1
+fi
+exec python3 -m devin_api_provider "$@"
