@@ -23,6 +23,8 @@ import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
+import json
+import urllib.request
 
 PROVIDER_KEY = "devin"
 PROVIDER_NAME = "Devin (Teams)"
@@ -34,7 +36,10 @@ TRANSPORT_ALIASES = ("transport", "api_mode")  # api_mode wins over transport wh
 EMPTY_VALUES = ("", "{}", "[]", "null", "~")
 
 # Starter catalog snapshot. Written as a list under `models:`, matching the live config.
-MODEL_IDS = (
+# With --live (or when the provider server is up on 127.0.0.1:8787 without
+# --offline), the full live catalog replaces this snapshot. Hand-added models
+# survive both; hand-removed starters come back on rerun (additive installer).
+MODEL_IDS = [
     "glm-5-2", "glm-5-3-max", "glm-5-3-high", "glm-5-3-low", "glm-5-3-flash-max",
     "claude-opus-5-5-max", "claude-opus-5-5-medium", "claude-sonnet-5-5-medium",
     "claude-sonnet-5-5-high", "claude-5-fable-max", "claude-5-fable-medium",
@@ -51,8 +56,8 @@ MODEL_IDS = (
     "swe-2-medium", "swe-1-7", "swe-1-7-lightning", "deepseek-v4-pro-max",
     "deepseek-v4-pro-high", "deepseek-v4-flash-max", "deepseek-v4-1-flash-high",
     "grok-4-7-xhigh", "grok-4-7-medium", "grok-4-5-high",
-)
-MODEL_SET = frozenset(MODEL_IDS)
+]
+MODEL_SET = set(MODEL_IDS)
 STRUCTURAL_KEYS = (frozenset({"providers", PROVIDER_KEY, "name", "models"})
                    | frozenset(API_ALIASES) | frozenset(TRANSPORT_ALIASES))
 
@@ -508,10 +513,41 @@ def _fail(msg: str) -> int:
     return 1
 
 
+
+# ------------------------------------------------------------- live catalog
+
+def _live_model_ids() -> list[str] | None:
+    """Ask the provider server (127.0.0.1:8787) for the live catalog, enabled only.
+    Returns None when the server is down or the answer is unusable — caller
+    falls back to the starter snapshot."""
+    api = DEFAULT_API.rsplit("/", 1)[0]  # http://127.0.0.1:8787
+    try:
+        with urllib.request.urlopen(f"{api}/v1/models", timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+    ids = [m.get("id") for m in data.get("data", []) if m.get("id")]
+    return sorted(ids) if ids else None
+
+
+def _resolve_models(live: bool, offline: bool) -> tuple[list[str], str]:
+    """(model ids to write, source note). --live forces the server; default tries
+    it opportunistically; --offline (or a down server) keeps the snapshot."""
+    if not offline:
+        ids = _live_model_ids()
+        if ids is not None:
+            if live or True:  # opportunistic: a reachable server always wins
+                return ids, f"live catalog ({len(ids)} models)"
+    return list(MODEL_IDS), f"starter snapshot ({len(MODEL_IDS)} models)"
+
 # ---------------------------------------------------------------------- main
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Merge or remove the Devin provider in Hermes config.yaml.")
+    ap.add_argument("--live", action="store_true",
+                    help="pull the live catalog from the provider (262 models) instead of the starter snapshot")
+    ap.add_argument("--offline", action="store_true",
+                    help="never contact the provider; force the starter snapshot")
     ap.add_argument("--dry-run", action="store_true", help="print the proposed edit; write nothing")
     ap.add_argument("--remove", action="store_true", help="remove the devin provider entry")
     ap.add_argument("--config", type=Path, help="config file (default: $HERMES_HOME/config.yaml)")
@@ -542,11 +578,19 @@ def main(argv: list[str] | None = None) -> int:
     bom = "\ufeff" if old_all.startswith("\ufeff") else ""
     old = old_all[len(bom):]
 
+    models_note = ""
+    if not args.remove:
+        effective, models_note = _resolve_models(args.live, args.offline)
+        MODEL_IDS[:] = effective
+        MODEL_SET.clear()
+        MODEL_SET.update(effective)
+
     try:
         if args.remove:
             new, summary = plan_remove(old)
         else:
             new, summary = plan_install(old, args.api, args.transport)
+            summary = f"{summary}; {models_note}"
         verdict = yaml_verify(old, new, present=not args.remove,
                               api=args.api, transport=args.transport)
     except ConfigError as exc:
