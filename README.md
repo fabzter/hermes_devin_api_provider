@@ -9,9 +9,8 @@ Unofficial. Not affiliated with Devin/Cognition, Windsurf/Codeium, or Hermes. It
 ## How it works
 
 1. `devin auth login` (the official Devin CLI) signs you in. The provider reads the token from `~/.local/share/devin/credentials.toml` unless an environment override is set (see Configuration).
-2. `devin-provider serve` runs an OpenAI-compatible endpoint on `127.0.0.1:8787`.
-3. By design, each chat request becomes a Connect-RPC call to the Devin cloud (protobuf over TLS, uncompressed). The reply goes back as SSE when streaming, or as one JSON body. The streaming path is not verified live in this sandbox.
-4. Hermes sees a custom provider named **Devin (Teams)**.
+2. `devin-provider serve` runs an OpenAI-compatible endpoint on `127.0.0.1:8787` (chat completions, streaming SSE, tool calls).
+3. Hermes sees a custom provider named **Devin (Teams)**.
 
 The design follows the `devin` provider in omp. Full design: `DESIGN.md`.
 
@@ -231,6 +230,6 @@ legacy/                         created by cutover; gitignored
 
 ## Status
 
-Live-verified record (2026-10-14): chat completions non-stream and streaming SSE (role/reasoning/content/tool_call/finish/usage chunks), tool-call round-trips including parallel calls, the live 262-model catalog, Hermes end-to-end, the LaunchAgent, and the CSRF guards (403/415 probes). Offline: 51/51 tests.
+Live-verified record (2026-10-14): chat completions non-stream and streaming SSE (role/reasoning/content/tool_call/finish/usage chunks), tool-call round-trips including parallel calls, the live 262-model catalog, Hermes end-to-end, the LaunchAgent, and the CSRF guards (403/415 probes). Offline: 68/68 tests.
 
 **Still unverified:** non-loopback binds, re-running the installer with a changed `--api` against that custom endpoint, and per-model entitlement (the catalog ignores tier; rejection happens at chat time).

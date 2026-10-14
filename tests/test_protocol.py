@@ -913,8 +913,6 @@ def test_catalog_fallback_serves_last_good_on_upstream_error():
             setattr(p, k, v)
 
 
-if __name__ == "__main__":
-    sys.exit(_run_all())
 
 
 # ---- classifier order fixtures (pinned to live/reference strings) -----------
@@ -1000,3 +998,6 @@ def test_unavailable_code_maps_503():
     e = _cls("unavailable", "server is busy")
     assert e.code == "unavailable" and e.status == 503
 
+
+if __name__ == "__main__":
+    sys.exit(_run_all())
