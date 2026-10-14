@@ -546,11 +546,19 @@ def test_finish_signal_maps_to_openai_reason() -> None:
 CLASSIFICATION = [
     (("permission_denied", "Unable to process request due to an MCP configuration issue"), ("upstream_error", 502)),
     (("invalid_argument", "Request blocked: violates the usage policy"), ("invalid_request", 400)),
-    (("unknown", "The model refused this request under its policy"), ("invalid_request", 400)),
+    # 'refused under its policy' carries no content-policy marker — generic error
+    # (reference regex only matches content-policy / remove-sensitive-content text)
+    (("unknown", "The model refused this request under its policy"), ("upstream_error", 502)),
     (("unauthenticated", "invalid api key"), ("unauthenticated", 401)),
+    # 'session expired' — 'expired' dropped from auth markers (matches plan/credit
+    # expiry); the gRPC code 'unauthenticated' still routes it to auth.
     (("unauthenticated", "session expired"), ("unauthenticated", 401)),
-    (("rate_limit", "rate limit exceeded"), ("rate_limited", 429)),
-    (("internal", "an internal error occurred"), ("upstream_internal", 502)),
+    # 'rate limit' code with no 'Resets in' window: text arm sits after policy in
+    # the relay order, and the code itself only matches resource_exhausted/429 —
+    # a bare rate_limit code with plain text stays upstream_error until a live
+    # capture pins otherwise (reference maps its bare 429 arm via HTTP status).
+    (("rate_limit", "rate limit exceeded"), ("upstream_error", 502)),
+    (("internal", "an internal error occurred"), ("upstream_error", 502)),
     (("weird_code", "something unexpected"), ("upstream_error", 502)),
 ]
 
@@ -761,3 +769,87 @@ def _run_all() -> int:
 
 if __name__ == "__main__":
     sys.exit(_run_all())
+
+
+# ---- classifier order fixtures (pinned to live/reference strings) -----------
+
+def _cls(code, msg, http=0):
+    return p._classify_error(code, msg, http, token="tok")
+
+
+def test_capacity_in_401_shell_is_not_auth():
+    e = _cls("permission_denied", "We're currently facing high demand for this model. Please try again later.", 401)
+    assert e.code == "unavailable" and e.status == 503, (e.code, e.status)
+
+
+def test_internal_error_text_in_401_shell_is_not_auth():
+    e = _cls("unauthenticated", "an internal error occurred (error ID: x)", 401)
+    assert e.code == "upstream_internal" and e.status == 502, (e.code, e.status)
+
+
+def test_hard_rate_limit_with_reset_beats_capacity():
+    e = _cls("unknown", "Reached message rate limit for this model. Please try again later. Resets in: 3h0m0s")
+    assert e.code == "rate_limited" and e.status == 429, (e.code, e.status)
+
+
+def test_bare_429_beats_capacity_text():
+    e = _cls("", "try again later", 429)
+    assert e.code == "rate_limited" and e.status == 429
+
+
+def test_content_policy_beats_auth():
+    e = _cls("permission_denied", "blocked by our content policy; please remove sensitive or unsafe content from your prompt", 403)
+    assert e.code == "invalid_request" and e.status == 400, (e.code, e.status)
+
+
+def test_live_content_policy_string_variant():
+    e = _cls("permission_denied", "please remove sensitive or unsafe content from your prompt")
+    assert e.code == "invalid_request" and e.status == 400
+
+
+def test_quota_arm():
+    e = _cls("", "You have insufficient credit to run this model")
+    assert e.code == "rate_limited" and e.status == 429
+
+
+def test_tier_wall_arm():
+    e = _cls("", "Please upgrade to access this model")
+    assert e.code == "invalid_request" and e.status == 400
+
+
+def test_tier_pro_word_boundary():
+    e = _cls("", "This model requires a Pro plan")
+    assert e.code == "invalid_request" and e.status == 400
+    e2 = _cls("", "process failed")  # 'pro' inside 'process' must NOT match
+    assert e2.code == "upstream_error" and e2.status == 502
+
+
+def test_mcp_gate_beats_auth():
+    e = _cls("permission_denied", "Unable to process request due to an MCP configuration issue.", 403)
+    assert e.code == "upstream_error" and e.status == 502
+
+
+def test_permission_denied_403_is_auth():
+    e = _cls("permission_denied", "permission denied", 403)
+    assert e.code == "unauthenticated" and e.status == 401
+
+
+def test_invalid_api_key_text_is_auth():
+    e = _cls("unauthenticated", "invalid api key", 401)
+    assert e.code == "unauthenticated" and e.status == 401
+
+
+def test_grpc_internal_is_permanent_upstream_error():
+    e = _cls("internal", "short fingerprint")
+    assert e.code == "upstream_error" and e.status == 502
+
+
+def test_expired_no_longer_auth_marker():
+    # 'expired' matches plan/credit expiry text — must NOT be auth
+    e = _cls("", "your plan expired")
+    assert e.code == "upstream_error" and e.status == 502
+
+
+def test_unavailable_code_maps_503():
+    e = _cls("unavailable", "server is busy")
+    assert e.code == "unavailable" and e.status == 503

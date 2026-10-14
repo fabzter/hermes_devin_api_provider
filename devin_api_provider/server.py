@@ -285,6 +285,7 @@ class _Handler(BaseHTTPRequestHandler):
     def _handle(self, method: str) -> None:
         try:
             self._authorize()
+            self._check_request_origin()
             allowed = _ROUTES.get(self._route)
             if allowed is None:
                 raise _HTTPError(404, f"no route for {self._route}", code="not_found")
@@ -314,6 +315,28 @@ class _Handler(BaseHTTPRequestHandler):
         except Exception:
             _log("internal error:\n" + traceback.format_exc())
             self._send_error(500, "internal server error", "server_error", "internal_error")
+
+    def _check_request_origin(self) -> None:
+        """CSRF / DNS-rebinding guard for the key-free loopback default.
+
+        Cross-site form posts arrive with an Origin header; browser fetches cannot
+        forge it. Reject any request that carries one. DNS-rebinding replies carry
+        an attacker-controlled Host, so require the loopback Host we serve.
+        Non-browser clients (hermes, curl, SDKs) send neither, or a correct Host,
+        and pass untouched. A text/plain cross-site POST needs no CORS preflight —
+        this is the only key-free thing standing between a webpage and the Teams
+        session token, so it runs before any route work.
+        """
+        if self.headers.get("Origin") or self.headers.get("Sec-Fetch-Site") not in (None, "same-origin", "none"):
+            raise _HTTPError(403, "cross-origin requests are not accepted", code="forbidden_origin")
+        host = (self.headers.get("Host") or "").strip().rstrip(".")
+        try:
+            host_only, _, port = host.partition(":")
+        except Exception:
+            host_only = host
+        allowed_hosts = {"127.0.0.1", "localhost", "[::1]", "::1"}
+        if host_only not in allowed_hosts:
+            raise _HTTPError(403, "unrecognized Host header", code="forbidden_host")
 
     def _authorize(self) -> None:
         expected = self.server.api_key
@@ -461,6 +484,15 @@ class _Handler(BaseHTTPRequestHandler):
     # -- low-level writers -----------------------------------------------------
 
     def _read_json_object(self) -> dict:
+        ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if ctype and ctype not in ("application/json", "text/json"):
+            # A cross-origin text/plain POST needs no preflight; hermes and every
+            # OpenAI SDK send the correct Content-Type. Missing header stays allowed
+            # (curl -d defaults and simple probes) — Origin/Host checks cover those.
+            raise _HTTPError(
+                415, f"Content-Type must be application/json, got {ctype!r}",
+                code="unsupported_media_type",
+            )
         if self.headers.get("Transfer-Encoding"):
             raise _HTTPError(
                 411,

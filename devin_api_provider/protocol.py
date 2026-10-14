@@ -35,8 +35,20 @@ PROVIDER_NAMES = {1: "cognition", 2: "openai", 3: "anthropic", 4: "google", 5: "
                   6: "deepseek", 7: "moonshot", 9: "zhipu", 11: "nvidia"}  # DESIGN § Catalog
 
 _MCP_GATE_MARKER = "unable to process request due to an mcp configuration issue"
-_POLICY_MARKERS = ("content policy", "usage policy", "safety policy", "content filter")
-_AUTH_MARKERS = ("invalid api key", "unauthenticated", "unauthorized", "expired", "invalid token")
+# Policy markers pinned to live upstream strings (devin-connect.js:2161) plus the
+# reference's own arm. 'usage policy'/'safety policy'/'content filter' never appear
+# in observed text — kept only as cheap extra matches, they cannot shadow anything.
+_POLICY_RE = re.compile(r"blocked by (our |the )?content policy|remove (sensitive|unsafe)( or (sensitive|unsafe))? content|content[_ ]policy")
+# Transient faults the upstream wraps in a 401/403 permission_denied shell. They MUST
+# be classified before the auth arm or a live token gets benched / re-login'd.
+_CAPACITY_RE = re.compile(r"high demand|try again later|currently (busy|overloaded|at capacity)|model is (busy|overloaded)|temporarily (busy|overloaded|unavailable)|server is busy|overloaded|(service|backend|model|server) (is )?(temporarily )?unavailable|capacity")
+_QUOTA_RE = re.compile(r"insufficient.*(credit|quota|balance|funds)|out of (credit|quota)|quota.*exceeded|credit.*exhausted")
+_TIER_RE = re.compile(r"/upgrade|upgrade to access|insufficient.*entitlement|requires? .*(paid|\bpro\b|team|enterprise)")
+# Hard per-model rate limit with an explicit reset window — must beat the capacity
+# arm, whose 'try again later' also matches this text.
+_RATE_LIMIT_RE = re.compile(r"(message |request )?rate limit(ed)?")
+_RESET_RE = re.compile(r"resets? in[:\s]")
+_AUTH_MARKERS = ("invalid api key", "unauthenticated", "invalid token")  # 'expired' matches plan/credit expiry — dropped
 _RATE_CODES = frozenset({"rate_limit", "rate_limited", "resource_exhausted"})
 _SCHEMA_DATA_KEYS = frozenset({"default", "const", "enum", "examples"})  # literal JSON, not schemas
 _SCHEMA_NAME_MAPS = frozenset({"properties", "patternProperties", "$defs", "definitions"})
@@ -420,24 +432,37 @@ def _redact(text: str, token: str) -> str:
 
 
 def _classify_error(code: str, message: str, http_status: int = 0, token: str = "") -> DevinError:
-    """Relay-binding order: MCP-gate → content policy → auth → rate limit → internal → other codes."""
+    """Relay-binding order (devin-connect.js classifyUpstreamError 2086-2191, re-verified):
+    gRPC internal → hard rate-limit w/ reset → 429/resource_exhausted → capacity →
+    'internal error occurred' → content policy → quota → tier wall → MCP gate →
+    auth (permission_denied/401/403) → invalid_argument → unavailable → deadline → other.
+    Transient faults ride inside a 401/403 permission_denied shell, so every
+    transient arm MUST precede the auth arm or a live token gets benched."""
     c = (code or "").strip().lower()
     m = (message or "").lower()
-    if _MCP_GATE_MARKER in m:
+    if c == "internal":  # PERMANENT client mistake (short fingerprint, gzip) — non-retryable
         kind, status = "upstream_error", 502
-    elif any(x in m for x in _POLICY_MARKERS) or ("policy" in m and "refus" in m):
-        kind, status = "invalid_request", 400
-    elif (c == "unauthenticated" or http_status == 401
+    elif _RATE_LIMIT_RE.search(m) and _RESET_RE.search(m):
+        kind, status = "rate_limited", 429  # hard limit w/ reset window — do NOT retry
+    elif http_status == 429 or c == "resource_exhausted":
+        kind, status = "rate_limited", 429
+    elif _CAPACITY_RE.search(m) or c == "unavailable":
+        kind, status = "unavailable", 503  # transient — retryable
+    elif "an internal error occurred" in m:
+        kind, status = "upstream_internal", 502  # transient backend fault, even in a 401 shell
+    elif _POLICY_RE.search(m):
+        kind, status = "invalid_request", 400  # per-REQUEST content block; token is alive
+    elif _QUOTA_RE.search(m):
+        kind, status = "rate_limited", 429  # account out of credit/quota
+    elif _TIER_RE.search(m):
+        kind, status = "invalid_request", 400  # tier wall: model needs a paid entitlement
+    elif _MCP_GATE_MARKER in m:  # permission_denied + MCP-gate text — not an auth failure
+        kind, status = "upstream_error", 502
+    elif (c in ("permission_denied", "unauthenticated") or http_status in (401, 403)
           or any(x in m for x in _AUTH_MARKERS)):
         kind, status = "unauthenticated", 401
-    elif c in _RATE_CODES or http_status == 429 or "rate limit" in m or "rate_limit" in m:
-        kind, status = "rate_limited", 429
-    elif c in ("internal", "upstream_internal") or "an internal error occurred" in m:
-        kind, status = "upstream_internal", 502
     elif c == "invalid_argument":
         kind, status = "invalid_request", 400
-    elif c == "unavailable":
-        kind, status = "unavailable", 503
     elif c == "deadline_exceeded":
         kind, status = "timeout", 504
     else:
